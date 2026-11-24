@@ -76,6 +76,7 @@
     label { display: block; font-size: 12px; color: var(--muted); margin: 0 0 4px; }
     .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
     .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+    .grid4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
     input[type=text], input[type=number] {
       width: 100%;
       background: #0d1526;
@@ -189,7 +190,7 @@
     .toast.show { opacity: 1; transform: translateY(0); }
     @media (max-width: 560px) {
       header, main { padding-left: 14px; padding-right: 14px; }
-      .grid2, .grid3 { grid-template-columns: 1fr; }
+      .grid2, .grid3, .grid4 { grid-template-columns: 1fr; }
       .clock { margin-left: 0; }
     }
   </style>
@@ -205,7 +206,7 @@
 
   <main>
     <section class="panel">
-      <h2>1. 公网出口 <span class="tag">先设公网 IP 与端口范围</span></h2>
+      <h2>1. 公网出口 <span class="tag">换址后旧出口退场，已建连接继续收包</span></h2>
       <form id="config-form" autocomplete="off">
         <div class="row">
           <div class="field grow">
@@ -224,10 +225,17 @@
         <div class="row" style="margin-top:10px">
           <label class="check"><input type="checkbox" id="config-replace"> 清空演练数据后应用</label>
           <button type="submit">应用公网配置</button>
+          <button type="button" class="ghost" id="switch-ip-btn">换址到该 IP（沿用当前端口范围）</button>
           <button type="button" class="ghost" id="reset-btn">清空演练数据</button>
         </div>
-        <div class="hint">端口范围共 <span class="mono" id="pool-size">—</span> 个公网端口。</div>
+        <div class="hint">端口范围共 <span class="mono" id="pool-size">—</span> 个公网端口。只改公网 IP、不改端口范围即执行换址演练。</div>
       </form>
+      <div class="hint" id="egress-hint">尚未设置公网出口。</div>
+    </section>
+
+    <section class="panel wide">
+      <h2>1a. 公网出口列表 <span class="tag">当前出口负责新建连接；退场出口只服务已建连接与冷却</span></h2>
+      <div id="egresses"><div class="empty">尚未设置公网出口。</div></div>
     </section>
 
     <section class="panel">
@@ -280,7 +288,7 @@
     </section>
 
     <section class="panel wide">
-      <h2>4. 上游端口占用 <span class="tag">耗尽时显示在用 / 冷却数量</span></h2>
+      <h2>4. 当前出口端口占用 <span class="tag">耗尽时只统计当前出口的在用 / 冷却数量</span></h2>
       <div id="upstreams"><div class="empty">尚未设置公网配置。</div></div>
     </section>
 
@@ -296,9 +304,9 @@
     </section>
 
     <section class="panel wide">
-      <h2>7. 模拟上游回包 <span class="tag">指定上游 → 公网端口</span></h2>
+      <h2>7. 模拟上游回包 <span class="tag">指定上游 → 目标公网 IP + 端口</span></h2>
       <form id="reply-form" autocomplete="off">
-        <div class="grid3">
+        <div class="grid4">
           <div class="field">
             <label for="reply-upstream-ip">上游 IP</label>
             <input type="text" id="reply-upstream-ip" value="198.51.100.7" spellcheck="false">
@@ -308,12 +316,17 @@
             <input type="number" id="reply-upstream-port" value="443" min="1" max="65535">
           </div>
           <div class="field">
+            <label for="reply-public-ip">目标公网 IP <span class="tag">留空=当前出口</span></label>
+            <input type="text" id="reply-public-ip" value="" placeholder="留空使用当前出口" spellcheck="false">
+          </div>
+          <div class="field">
             <label for="reply-public-port">公网端口</label>
             <input type="number" id="reply-public-port" value="40000" min="1" max="65535">
           </div>
         </div>
         <div class="row" style="margin-top:10px">
           <button type="submit">发送回包</button>
+          <span class="hint" style="margin:0">退场出口上的映射可显式填写原公网 IP 回包；留空始终查当前出口。</span>
         </div>
       </form>
       <div class="result" id="reply-result">等待发送回包。送达时会显示内网端点，丢弃时会显示原因。</div>
@@ -330,11 +343,14 @@
     <section class="panel wide">
       <h2>演练规则</h2>
       <ul class="rules">
-        <li>公网端口按“公网端口 + 上游端点”复用：不同上游端点可以占用同一个公网端口。</li>
-        <li>同一上游端点的连接即使并发建立，也一定分到不同的公网端口。</li>
-        <li>连接关闭后，“公网端口 + 原上游端点”冷却 {{ cooldown_seconds }} 秒，期间不得再分配给该上游；其他上游可立即使用该端口。</li>
-        <li>上游回包必须命中“公网端口 + 上游端点”的当前映射；冷却中的迟包一律丢弃。</li>
-        <li>耗尽时按上游列出在用与冷却的端口数量，并给出可推进的时间。</li>
+        <li>公网端口按“公网 IP + 公网端口 + 上游端点”复用：同一出口上不同上游端点可以占用同一个公网端口。</li>
+        <li>同一出口、同一上游端点的连接即使并发建立，也一定分到不同的公网端口。</li>
+        <li>连接关闭后，“公网 IP + 公网端口 + 原上游端点”冷却 {{ cooldown_seconds }} 秒，期间不得再分配给该上游；其他上游、其他出口可立即使用该端口。</li>
+        <li>换址后旧出口退场：已建连接保留原公网 IP 继续收包，关闭后仍在旧出口冷却；新连接只从当前出口分配。</li>
+        <li>退场出口的连接全关、冷却全到期后自动移除；退场期间可以切回原 IP，原有映射和冷却照常生效。</li>
+        <li>有出口在退场时，切换到第三个公网 IP 会被拒绝，保持现状；等待退场结束后再切。</li>
+        <li>上游回包必须命中“公网 IP + 端口 + 上游端点”的映射；冷却中的迟包一律丢弃。</li>
+        <li>耗尽时按当前出口列出在用与冷却的端口数量，并给出可推进的时间。</li>
       </ul>
     </section>
   </main>
@@ -398,24 +414,74 @@
 
       const config = snapshot.config;
       $("pool-size").textContent = config ? String(config.size) : "—";
-      // 只在首次渲染时回填表单，避免用户正在输入时被轮询覆盖。
-      if (config && !state.formInitialized) {
-        $("public-ip").value = config.public_ip;
-        $("port-min").value = config.port_min;
-        $("port-max").value = config.port_max;
-        state.formInitialized = true;
+      // 首次渲染时回填表单；之后只有当前出口真的变了才回填，
+      // 避免用户正在输入时被轮询覆盖。
+      if (config) {
+        if (!state.formInitialized) {
+          $("public-ip").value = config.public_ip;
+          $("port-min").value = config.port_min;
+          $("port-max").value = config.port_max;
+          state.formInitialized = true;
+          state.formIp = config.public_ip;
+        } else if (state.formIp !== config.public_ip && $("public-ip").value.trim() === state.formIp) {
+          $("public-ip").value = config.public_ip;
+          $("port-min").value = config.port_min;
+          $("port-max").value = config.port_max;
+          state.formIp = config.public_ip;
+        }
       }
 
       const conns = snapshot.connections;
       $("connection-stats").innerHTML = `
         <div class="stat"><div class="n">${snapshot.summary.active_connections}</div><div class="k">活动连接</div></div>
         <div class="stat"><div class="n">${snapshot.summary.cooldowns}</div><div class="k">冷却组合</div></div>
-        <div class="stat"><div class="n">${snapshot.summary.upstreams}</div><div class="k">涉及上游</div></div>
-        <div class="stat"><div class="n">${config ? config.size : "—"}</div><div class="k">公网端口池</div></div>`;
+        <div class="stat"><div class="n">${snapshot.summary.upstreams}</div><div class="k">当前出口上游</div></div>
+        <div class="stat"><div class="n">${config ? config.size : "—"}</div><div class="k">公网端口池</div></div>
+        <div class="stat"><div class="n">${snapshot.summary.retiring_egresses || 0}</div><div class="k">退场出口</div></div>`;
 
+      renderEgresses(snapshot);
       renderUpstreams(snapshot);
       renderConnections(conns);
       renderCooldowns(snapshot.cooldowns);
+    }
+
+    function renderEgresses(snapshot) {
+      const box = $("egresses");
+      const hint = $("egress-hint");
+      const egresses = snapshot.egresses || [];
+      if (!egresses.length) {
+        box.innerHTML = `<div class="empty">尚未设置公网出口。</div>`;
+        hint.textContent = "尚未设置公网出口。";
+        return;
+      }
+      const current = egresses.find((item) => item.current);
+      const retiring = egresses.filter((item) => item.retiring);
+      hint.textContent = retiring.length
+        ? `当前出口 ${current.public_ip}；退场出口 ${retiring.map((item) => item.public_ip).join("、")} 仍有映射或冷却，排空后自动移除。`
+        : `当前出口 ${current.public_ip}，没有退场出口。`;
+      const rows = egresses.map((item) => {
+        const pill = item.current
+          ? `<span class="pill ok">当前出口</span>`
+          : `<span class="pill warn">退场中</span>`;
+        const action = item.current
+          ? ""
+          : `<button type="button" class="ghost small" data-switch-egress="${esc(item.public_ip)}">切回此出口</button>`;
+        return `<tr>
+          <td class="mono">${esc(item.label)}</td>
+          <td>${pill}</td>
+          <td class="mono">${item.active_connections}</td>
+          <td class="mono">${item.cooldowns}</td>
+          <td class="mono">${esc(numbers(item.active_ports))}</td>
+          <td class="mono">${esc(numbers(item.cooling_ports))}</td>
+          <td>${action}</td>
+        </tr>`;
+      }).join("");
+      box.innerHTML = `<table>
+        <thead><tr>
+          <th>公网出口</th><th>状态</th><th>活动连接</th><th>冷却组合</th><th>在用公网端口</th><th>冷却中公网端口</th><th></th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>`;
     }
 
     function renderUpstreams(snapshot) {
@@ -429,6 +495,7 @@
           ? `<span class="pill bad">已耗尽</span>`
           : `<span class="pill ok">可用 ${item.available_count}</span>`;
         return `<tr>
+          <td class="mono">${esc(item.public_ip || "")}</td>
           <td class="mono">${esc(item.upstream.label)}</td>
           <td class="mono">${item.active_count}</td>
           <td class="mono">${item.cooling_count}</td>
@@ -440,7 +507,7 @@
       }).join("");
       box.innerHTML = `<table>
         <thead><tr>
-          <th>上游端点</th><th>在用端口数</th><th>冷却端口数</th><th>占用 / 容量</th><th>状态</th><th>在用公网端口</th><th>冷却中公网端口</th>
+          <th>当前出口</th><th>上游端点</th><th>在用端口数</th><th>冷却端口数</th><th>占用 / 容量</th><th>状态</th><th>在用公网端口</th><th>冷却中公网端口</th>
         </tr></thead>
         <tbody>${rows}</tbody>
       </table>`;
@@ -452,18 +519,24 @@
         box.innerHTML = `<div class="empty">暂无活动连接。</div>`;
         return;
       }
-      const rows = conns.map((c) => `<tr>
+      const rows = conns.map((c) => {
+        const egress = c.egress_retiring
+          ? `<span class="pill warn">退场出口</span>`
+          : `<span class="pill ok">当前出口</span>`;
+        return `<tr>
         <td class="mono">#${c.id}</td>
         <td class="mono">${esc(c.internal.label)}</td>
         <td class="mono">${esc(c.upstream.label)}</td>
         <td class="mono">${c.public ? esc(c.public.label) : "—"}</td>
+        <td>${egress}</td>
         <td class="mono">${esc(c.created_label)}</td>
         <td class="mono">${c.age_seconds}s</td>
         <td><button class="danger small" data-close="${c.id}">关闭</button></td>
-      </tr>`).join("");
+      </tr>`;
+      }).join("");
       box.innerHTML = `<table>
         <thead><tr>
-          <th>连接</th><th>内网端点</th><th>上游端点</th><th>公网映射</th><th>建立于</th><th>存活</th><th></th>
+          <th>连接</th><th>内网端点</th><th>上游端点</th><th>公网映射</th><th>出口状态</th><th>建立于</th><th>存活</th><th></th>
         </tr></thead>
         <tbody>${rows}</tbody>
       </table>`;
@@ -477,6 +550,7 @@
       }
       const rows = cooldowns.map((c) => `<tr>
         <td class="mono">${esc(c.public ? c.public.label : c.public_port)}</td>
+        <td>${c.egress_retiring ? `<span class="pill warn">退场出口</span>` : `<span class="pill ok">当前出口</span>`}</td>
         <td class="mono">${esc(c.upstream.label)}</td>
         <td class="mono">${esc(c.internal.label)}</td>
         <td class="mono">#${c.connection_id}</td>
@@ -486,7 +560,7 @@
       </tr>`).join("");
       box.innerHTML = `<table>
         <thead><tr>
-          <th>公网端口</th><th>原上游端点</th><th>原内网端点</th><th>连接</th><th>关闭于</th><th>解冻时刻</th><th>剩余</th>
+          <th>公网端口</th><th>出口状态</th><th>原上游端点</th><th>原内网端点</th><th>连接</th><th>关闭于</th><th>解冻时刻</th><th>剩余</th>
         </tr></thead>
         <tbody>${rows}</tbody>
       </table>`;
@@ -547,14 +621,71 @@
       }
     }
 
+    async function applyConfig(payload, label) {
+      try {
+        const body = await guard(() => post("/api/config", payload), label);
+        const config = body.snapshot.config;
+        const action = body.result.action;
+        state.formIp = config.public_ip;
+        $("public-ip").value = config.public_ip;
+        $("port-min").value = config.port_min;
+        $("port-max").value = config.port_max;
+        if (action === "switched") {
+          log(`公网出口换址：${body.result.previous_public_ip} → ${config.public_ip}；旧出口退场，已建连接保留原公网 IP`, "warn");
+        } else if (action === "switched_back") {
+          log(`已切回原出口 ${config.public_ip}；该出口已有的映射和冷却照常生效`, "warn");
+        } else {
+          log(`公网配置设为 ${config.public_ip}:${config.port_min}-${config.port_max}（${config.size} 个端口）`, "ok");
+        }
+        $("config-replace").checked = false;
+        return body;
+      } catch (err) {
+        return null;
+      }
+    }
+
     $("config-form").addEventListener("submit", async (event) => {
       event.preventDefault();
-      const payload = readFormConfig();
+      await applyConfig(readFormConfig(), "应用公网配置");
+    });
+
+    $("switch-ip-btn").addEventListener("click", async () => {
+      const config = state.snapshot && state.snapshot.config;
+      const targetIp = $("public-ip").value.trim();
+      if (!config) {
+        toast("请先应用一次公网配置");
+        return;
+      }
+      if (!targetIp || targetIp === config.public_ip) {
+        toast("请在公网 IP 填一个不同的目标 IP");
+        return;
+      }
+      await applyConfig(
+        { public_ip: targetIp, port_min: config.port_min, port_max: config.port_max },
+        "换址"
+      );
+    });
+
+    document.addEventListener("click", async (event) => {
+      const switchBtn = event.target.closest("[data-switch-egress]");
+      if (switchBtn && switchBtn.dataset.switchEgress) {
+        const targetIp = switchBtn.dataset.switchEgress;
+        const config = state.snapshot && state.snapshot.config;
+        if (!config) return;
+        await applyConfig(
+          { public_ip: targetIp, port_min: config.port_min, port_max: config.port_max },
+          "切回出口"
+        );
+        return;
+      }
+
+      const closeBtn = event.target.closest("[data-close]");
+      if (!closeBtn) return;
+      const id = closeBtn.dataset.close;
       try {
-        const body = await guard(() => post("/api/config", payload), "应用公网配置");
-        const config = body.snapshot.config;
-        log(`公网配置设为 ${config.public_ip}:${config.port_min}-${config.port_max}（${config.size} 个端口）`, "ok");
-        $("config-replace").checked = false;
+        const body = await guard(() => post(`/api/connections/${id}/close`), "关闭连接");
+        const cooldown = body.result.cooldown;
+        log(`连接 #${cooldown.connection_id} 关闭；公网 ${cooldown.public.label} + 上游 ${cooldown.upstream.label} 冷却至 ${cooldown.cooldown_until_label}`, "warn");
       } catch (err) { /* 已提示 */ }
     });
 
@@ -591,18 +722,8 @@
         log(`连接 #${connection.id} ${connection.internal.label} → ${connection.upstream.label} 分配公网 ${connection.public.label}`, "ok");
         $("reply-upstream-ip").value = connection.upstream.ip;
         $("reply-upstream-port").value = connection.upstream.port;
+        $("reply-public-ip").value = connection.public.ip;
         $("reply-public-port").value = connection.public.port;
-      } catch (err) { /* 已提示 */ }
-    });
-
-    document.addEventListener("click", async (event) => {
-      const btn = event.target.closest("[data-close]");
-      if (!btn) return;
-      const id = btn.dataset.close;
-      try {
-        const body = await guard(() => post(`/api/connections/${id}/close`), "关闭连接");
-        const cooldown = body.result.cooldown;
-        log(`连接 #${cooldown.connection_id} 关闭；公网 ${cooldown.public_port} + 上游 ${cooldown.upstream.label} 冷却至 ${cooldown.cooldown_until_label}`, "warn");
       } catch (err) { /* 已提示 */ }
     });
 
@@ -613,15 +734,17 @@
         upstream_port: readNumber("reply-upstream-port"),
         public_port: readNumber("reply-public-port"),
       };
+      const targetIp = $("reply-public-ip").value.trim();
+      if (targetIp) payload.public_ip = targetIp;
       try {
         const body = await post("/api/replies", payload);
         render(body.snapshot);
         const result = body.result;
         renderReply(result);
         if (result.outcome === "delivered") {
-          log(`回包 上游 ${result.upstream.label} → 公网 ${result.public.port} 送达 ${result.internal.label}（连接 #${result.connection_id}）`, "ok");
+          log(`回包 上游 ${result.upstream.label} → 公网 ${result.public.label} 送达 ${result.internal.label}（连接 #${result.connection_id}${result.egress_retiring ? "，退场出口" : ""}）`, "ok");
         } else {
-          log(`回包 上游 ${result.upstream.label} → 公网 ${result.public.port} 丢弃：${result.reason_code} · ${result.reason}`, "bad");
+          log(`回包 上游 ${result.upstream.label} → 公网 ${result.public.label} 丢弃：${result.reason_code} · ${result.reason}`, "bad");
         }
       } catch (err) {
         renderReply({ outcome: "dropped", reason_code: "REQUEST_FAILED", reason: err.message, public: { label: "—" }, upstream: { label: "—" }, at_label: "" });

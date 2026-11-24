@@ -132,6 +132,7 @@ def create_app(*, cooldown_seconds: int | None = None) -> Flask:
                 body.get("upstream_ip"),
                 body.get("upstream_port"),
                 body.get("public_port"),
+                body.get("public_ip"),
             )
         )
 

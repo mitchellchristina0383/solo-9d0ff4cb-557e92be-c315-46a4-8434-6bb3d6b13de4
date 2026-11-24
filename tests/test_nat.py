@@ -296,6 +296,318 @@ class ConfigAndValidationTests(unittest.TestCase):
                     table.advance(bad)
 
 
+class EgressSwitchTests(unittest.TestCase):
+    """换址演练：旧出口退场、已建连接续存、切回与三方拒绝。"""
+
+    def test_switch_keeps_established_connections_on_old_ip(self):
+        table = make_table()
+        old = open_conn(table, i="10.0.0.21")
+
+        result = table.configure("203.0.113.20", 40000, 40009)
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["action"], "switched")
+        self.assertEqual(result["previous_public_ip"], "203.0.113.10")
+
+        snapshot = table.snapshot()
+        self.assertEqual(snapshot["config"]["public_ip"], "203.0.113.20")
+        self.assertEqual(snapshot["summary"]["retiring_egresses"], 1)
+        self.assertEqual(snapshot["connections"][0]["public"]["ip"], "203.0.113.10")
+        self.assertTrue(snapshot["connections"][0]["egress_retiring"])
+
+        new = open_conn(table, i="10.0.0.22")
+        self.assertEqual(new["public"]["ip"], "203.0.113.20")
+        self.assertFalse(new["egress_retiring"])
+
+        # 已建连接在原出口继续收包。
+        delivered = table.simulate_reply(
+            "198.51.100.7", 443, old["public"]["port"], public_ip="203.0.113.10"
+        )
+        self.assertEqual(delivered["outcome"], "delivered")
+        self.assertEqual(delivered["internal"]["ip"], "10.0.0.21")
+        self.assertTrue(delivered["egress_retiring"])
+
+    def test_new_connections_only_use_current_egress_even_if_old_pool_full(self):
+        table = make_table(size=1)
+        open_conn(table)  # 旧出口唯一端口被占用
+
+        table.configure("203.0.113.20", 40000, 40000)
+        # 旧出口满了不影响当前出口分配。
+        current = open_conn(table, i="10.0.0.22")
+        self.assertEqual(current["public"]["ip"], "203.0.113.20")
+        self.assertEqual(current["public"]["port"], 40000)
+        with self.assertRaises(NatError) as ctx:
+            open_conn(table, i="10.0.0.23")
+        self.assertEqual(ctx.exception.code, "NO_PORT_AVAILABLE")
+        self.assertEqual(ctx.exception.details["public_ip"], "203.0.113.20")
+        self.assertEqual(ctx.exception.details["active_count"], 1)
+        # 旧出口的在用端口不计入当前出口的耗尽统计。
+        self.assertEqual(ctx.exception.details["capacity"], 1)
+
+    def test_reply_without_target_ip_uses_current_egress(self):
+        table = make_table()
+        open_conn(table, i="10.0.0.21")
+        table.configure("203.0.113.20", 40000, 40009)
+
+        # 旧出口有映射，但省略目标 IP 时只查当前出口。
+        result = table.simulate_reply("198.51.100.7", 443, 40000)
+        self.assertEqual(result["outcome"], "dropped")
+        self.assertEqual(result["reason_code"], "NO_MAPPING")
+        self.assertEqual(result["public"]["ip"], "203.0.113.20")
+
+        # 显式填旧 IP 才能命中已建连接。
+        explicit = table.simulate_reply(
+            "198.51.100.7", 443, 40000, public_ip="203.0.113.10"
+        )
+        self.assertEqual(explicit["outcome"], "delivered")
+
+        # 空串等同省略，仍查当前出口。
+        blank = table.simulate_reply("198.51.100.7", 443, 40000, public_ip="")
+        self.assertEqual(blank["outcome"], "dropped")
+        self.assertEqual(blank["public"]["ip"], "203.0.113.20")
+
+    def test_closed_old_connection_cools_on_old_egress_and_survives_switch_back(self):
+        table = make_table(size=1)
+        old = open_conn(table)
+        table.configure("203.0.113.20", 40000, 40000)
+        table.close_connection(old["id"])
+
+        # 旧出口的冷却仍在，切回原 IP 后继续生效。
+        switched_back = table.configure("203.0.113.10", 40000, 40000)
+        self.assertEqual(switched_back["action"], "switched_back")
+        snapshot = table.snapshot()
+        self.assertEqual(snapshot["config"]["public_ip"], "203.0.113.10")
+        self.assertEqual(len(snapshot["cooldowns"]), 1)
+        self.assertEqual(snapshot["cooldowns"][0]["public"]["ip"], "203.0.113.10")
+
+        with self.assertRaises(NatError) as ctx:
+            open_conn(table)
+        self.assertEqual(ctx.exception.details["cooling_count"], 1)
+        self.assertEqual(ctx.exception.details["public_ip"], "203.0.113.10")
+
+        # 切回后原出口的已建连接（如有）也继续有效；这里先推进冷却再建。
+        table.advance(60)
+        again = open_conn(table)
+        self.assertEqual(again["public"]["ip"], "203.0.113.10")
+
+    def test_switch_back_keeps_mapping_of_other_egress(self):
+        table = make_table(size=2)
+        first = open_conn(table, i="10.0.0.21")
+        table.configure("203.0.113.20", 40000, 40001)
+        second = open_conn(table, i="10.0.0.22")
+        self.assertEqual(second["public"]["ip"], "203.0.113.20")
+
+        table.configure("203.0.113.10", 40000, 40001)
+        snapshot = table.snapshot()
+        by_id = {item["id"]: item for item in snapshot["connections"]}
+        # 切回原 IP 后，原出口连接重新算“当前”，新出口连接变成退场。
+        self.assertEqual(by_id[first["id"]]["public"]["ip"], "203.0.113.10")
+        self.assertFalse(by_id[first["id"]]["egress_retiring"])
+        self.assertEqual(by_id[second["id"]]["public"]["ip"], "203.0.113.20")
+        self.assertTrue(by_id[second["id"]]["egress_retiring"])
+
+        delivered = table.simulate_reply("198.51.100.7", 443, 40000)
+        self.assertEqual(delivered["public"]["ip"], "203.0.113.10")
+        delivered_old = table.simulate_reply(
+            "198.51.100.7", 443, 40000, public_ip="203.0.113.20"
+        )
+        self.assertEqual(delivered_old["internal"]["ip"], "10.0.0.22")
+
+    def test_retiring_egress_is_removed_when_drained(self):
+        table = make_table()
+        old = open_conn(table)
+        table.configure("203.0.113.20", 40000, 40009)
+        self.assertEqual(table.snapshot()["summary"]["retiring_egresses"], 1)
+
+        table.close_connection(old["id"])
+        # 还有冷却，退场出口不能被移除。
+        table.advance(30)
+        snapshot = table.snapshot()
+        self.assertEqual(snapshot["summary"]["retiring_egresses"], 1)
+        self.assertEqual(snapshot["summary"]["egresses"], 2)
+
+        expired = table.advance(30)
+        self.assertEqual(expired["removed_egresses"], 1)
+        snapshot = table.snapshot()
+        self.assertEqual(snapshot["summary"]["retiring_egresses"], 0)
+        self.assertEqual(snapshot["summary"]["egresses"], 1)
+        self.assertEqual([item["public_ip"] for item in snapshot["egresses"]], ["203.0.113.20"])
+        self.assertEqual(snapshot["cooldowns"], [])
+
+    def test_advance_never_removes_switched_back_current_egress(self):
+        table = make_table(size=1)
+        old = open_conn(table)
+        table.close_connection(old["id"])
+        table.configure("203.0.113.20", 40000, 40000)
+        table.configure("203.0.113.10", 40000, 40000)  # 切回，原出口重新成为当前
+
+        result = table.advance(60)
+        self.assertEqual(result["now"], 60)
+        snapshot = table.snapshot()
+        self.assertEqual(snapshot["config"]["public_ip"], "203.0.113.10")
+        self.assertEqual(snapshot["summary"]["egresses"], 1)
+        self.assertEqual(snapshot["egresses"][0]["current"], True)
+
+    def test_reset_removes_retiring_egress_but_keeps_current(self):
+        table = make_table()
+        open_conn(table)
+        table.configure("203.0.113.20", 40000, 40009)
+        table.reset()
+        snapshot = table.snapshot()
+        self.assertEqual(snapshot["summary"]["egresses"], 1)
+        self.assertEqual(snapshot["summary"]["retiring_egresses"], 0)
+        self.assertEqual(snapshot["config"]["public_ip"], "203.0.113.20")
+
+    def test_replace_clears_retiring_egress(self):
+        table = make_table()
+        open_conn(table)
+        table.configure("203.0.113.20", 40000, 40009)
+        table.configure("203.0.113.20", 40000, 40009, replace=True)
+        snapshot = table.snapshot()
+        self.assertEqual(snapshot["summary"]["egresses"], 1)
+        self.assertEqual(snapshot["connections"], [])
+
+    def test_third_ip_rejected_while_egress_retiring(self):
+        table = make_table()
+        open_conn(table)
+        table.configure("203.0.113.20", 40000, 40009)
+
+        with self.assertRaises(NatError) as ctx:
+            table.configure("203.0.113.30", 40000, 40009)
+        err = ctx.exception
+        self.assertEqual(err.code, "EGRESS_RETIRING")
+        self.assertEqual(err.status, 409)
+        self.assertEqual(err.details["current"]["public_ip"], "203.0.113.20")
+        self.assertEqual(err.details["retiring"][0]["public_ip"], "203.0.113.10")
+
+        # 被拒后保持现状：仍是 203.0.113.20，旧出口仍退场，连接仍在。
+        snapshot = table.snapshot()
+        self.assertEqual(snapshot["config"]["public_ip"], "203.0.113.20")
+        self.assertEqual(snapshot["summary"]["retiring_egresses"], 1)
+        self.assertEqual(snapshot["summary"]["active_connections"], 1)
+
+        # 退场排空后可以切到第三个 IP。
+        table.close_connection(snapshot["connections"][0]["id"])
+        table.advance(60)
+        result = table.configure("203.0.113.30", 40000, 40009)
+        self.assertEqual(result["action"], "switched")
+        self.assertEqual(result["previous_public_ip"], "203.0.113.20")
+
+    def test_unknown_public_ip_reports_no_mapping(self):
+        table = make_table()
+        table.configure("203.0.113.20", 40000, 40009)
+        result = table.simulate_reply(
+            "198.51.100.7", 443, 40000, public_ip="203.0.113.99"
+        )
+        self.assertEqual(result["outcome"], "dropped")
+        self.assertEqual(result["reason_code"], "NO_MAPPING")
+        self.assertFalse(result["egress_known"])
+
+    def test_same_config_with_replace_clears_state(self):
+        table = make_table()
+        open_conn(table)
+        result = table.configure("203.0.113.10", 40000, 40009)
+        self.assertFalse(result["changed"])
+        self.assertEqual(result["action"], "unchanged")
+        self.assertEqual(table.snapshot()["summary"]["active_connections"], 1)
+
+        replaced = table.configure("203.0.113.10", 40000, 40009, replace=True)
+        self.assertFalse(replaced["changed"])
+        self.assertEqual(replaced["action"], "replaced")
+        self.assertEqual(table.snapshot()["summary"]["active_connections"], 0)
+
+    def test_switch_while_no_old_state_does_not_create_retiring_egress(self):
+        table = make_table()
+        result = table.configure("203.0.113.20", 40000, 40009)
+        self.assertEqual(result["action"], "switched")
+        snapshot = table.snapshot()
+        self.assertEqual(snapshot["summary"]["egresses"], 1)
+        self.assertEqual(snapshot["summary"]["retiring_egresses"], 0)
+
+    def test_concurrent_opens_land_wholly_before_or_after_switch(self):
+        table = make_table(size=200)
+        old_ip, new_ip = "203.0.113.10", "203.0.113.20"
+        results: list[dict] = []
+        errors: list[Exception] = []
+        barrier = threading.Barrier(41)
+
+        def worker(index: int) -> None:
+            barrier.wait()
+            try:
+                results.append(open_conn(table, i=f"10.2.0.{index}"))
+            except Exception as exc:  # pragma: no cover - 失败时用于断言
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(40)]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        switched = table.configure(new_ip, 40000, 40199)
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(errors, [])
+        self.assertTrue(switched["changed"])
+        # 每个连接要么完整落在旧出口，要么完整落在新出口。
+        for item in results:
+            self.assertIn(item["public"]["ip"], {old_ip, new_ip})
+        # 同一出口、同一上游的端口仍然唯一。
+        keys = [(item["public"]["ip"], item["public"]["port"]) for item in results]
+        self.assertEqual(len(keys), len(set(keys)))
+
+        snapshot = table.snapshot()
+        self.assertEqual(snapshot["summary"]["active_connections"], 40)
+        for conn in snapshot["connections"]:
+            self.assertEqual(conn["public"]["ip"], conn["egress_ip"])
+            self.assertEqual(conn["egress_retiring"], conn["egress_ip"] == old_ip)
+
+    def test_api_accepts_optional_public_ip_for_replies(self):
+        app = create_app(cooldown_seconds=60)
+        client = app.test_client()
+        client.post(
+            "/api/config",
+            json={"public_ip": "203.0.113.10", "port_min": 40000, "port_max": 40009},
+        )
+        created = client.post(
+            "/api/connections",
+            json={
+                "internal_ip": "10.0.0.21",
+                "internal_port": 51515,
+                "upstream_ip": "198.51.100.7",
+                "upstream_port": 443,
+            },
+        ).get_json()["result"]
+        client.post(
+            "/api/config",
+            json={"public_ip": "203.0.113.20", "port_min": 40000, "port_max": 40009},
+        )
+
+        omitted = client.post(
+            "/api/replies",
+            json={"upstream_ip": "198.51.100.7", "upstream_port": 443, "public_port": 40000},
+        ).get_json()["result"]
+        self.assertEqual(omitted["outcome"], "dropped")
+        self.assertEqual(omitted["public"]["ip"], "203.0.113.20")
+
+        explicit = client.post(
+            "/api/replies",
+            json={
+                "upstream_ip": "198.51.100.7",
+                "upstream_port": 443,
+                "public_port": 40000,
+                "public_ip": "203.0.113.10",
+            },
+        ).get_json()["result"]
+        self.assertEqual(explicit["outcome"], "delivered")
+        self.assertEqual(explicit["connection_id"], created["id"])
+
+        third = client.post(
+            "/api/config",
+            json={"public_ip": "203.0.113.30", "port_min": 40000, "port_max": 40009},
+        )
+        self.assertEqual(third.status_code, 409)
+        self.assertEqual(third.get_json()["error"]["code"], "EGRESS_RETIRING")
+
+
 class ApiTests(unittest.TestCase):
     def setUp(self):
         self.app = create_app(cooldown_seconds=60)
